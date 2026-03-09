@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { OpenAICompat } from "@oh-my-pi/pi-ai";
+import { Effort, type OpenAICompat, type ThinkingConfig } from "@oh-my-pi/pi-ai";
 import { kNoAuth, MODEL_ROLES, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { Snowflake } from "@oh-my-pi/pi-utils";
+import { hookFetch, Snowflake } from "@oh-my-pi/pi-utils";
 
 describe("ModelRegistry", () => {
 	let tempDir: string;
@@ -38,6 +38,7 @@ describe("ModelRegistry", () => {
 			id: string;
 			name: string;
 			reasoning: boolean;
+			thinking?: ThinkingConfig;
 			input: string[];
 			cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 			contextWindow: number;
@@ -48,7 +49,7 @@ describe("ModelRegistry", () => {
 	/** Create minimal provider config  */
 	function providerConfig(
 		baseUrl: string,
-		models: Array<{ id: string; name?: string }>,
+		models: Array<{ id: string; name?: string; reasoning?: boolean; thinking?: ThinkingConfig }>,
 		api: string = "anthropic-messages",
 	) {
 		return {
@@ -58,7 +59,8 @@ describe("ModelRegistry", () => {
 			models: models.map(m => ({
 				id: m.id,
 				name: m.name ?? m.id,
-				reasoning: false,
+				reasoning: m.reasoning ?? false,
+				thinking: m.thinking,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 100000,
@@ -350,6 +352,48 @@ describe("ModelRegistry", () => {
 		});
 	});
 
+	describe("thinking metadata normalization", () => {
+		test("custom models preserve explicit thinking", () => {
+			const thinking: ThinkingConfig = {
+				mode: "anthropic-adaptive",
+				minLevel: Effort.Minimal,
+				maxLevel: Effort.High,
+			};
+
+			writeModelsJson({
+				anthropic: providerConfig("https://my-proxy.example.com/v1", [
+					{ id: "claude-custom", reasoning: true, thinking },
+				]),
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = getModelsForProvider(registry, "anthropic").find(m => m.id === "claude-custom");
+
+			expect(model?.thinking).toEqual(thinking);
+		});
+
+		test("model overrides can replace canonical thinking metadata", () => {
+			writeRawModelsJson({
+				openrouter: {
+					modelOverrides: {
+						"anthropic/claude-sonnet-4": {
+							thinking: { mode: "budget", minLevel: Effort.Low, maxLevel: Effort.Medium },
+						},
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = getModelsForProvider(registry, "openrouter").find(m => m.id === "anthropic/claude-sonnet-4");
+
+			expect(model?.thinking).toEqual({
+				mode: "budget",
+				minLevel: Effort.Low,
+				maxLevel: Effort.Medium,
+			});
+		});
+	});
+
 	describe("modelOverrides (per-model customization)", () => {
 		test("model override applies to a single built-in model", () => {
 			writeRawModelsJson({
@@ -619,25 +663,29 @@ describe("ModelRegistry", () => {
 	});
 	describe("runtime discovery", () => {
 		test("auto-discovers ollama models without provider config", async () => {
-			const originalFetch = globalThis.fetch;
-			globalThis.fetch = (async (input: string | URL | Request) => {
-				expect(String(input)).toBe("http://127.0.0.1:11434/api/tags");
-				return new Response(JSON.stringify({ models: [{ name: "phi4-mini" }] }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				});
-			}) as unknown as typeof fetch;
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "http://127.0.0.1:11434/api/tags") {
+					return new Response(JSON.stringify({ models: [{ name: "phi4-mini" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "http://127.0.0.1:11434/api/show") {
+					return new Response(JSON.stringify({ capabilities: ["completion"] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
 
-			try {
-				const registry = new ModelRegistry(authStorage, modelsJsonPath);
-				await registry.refresh();
-				const ollamaModels = getModelsForProvider(registry, "ollama");
-				expect(ollamaModels.some(m => m.id === "phi4-mini")).toBe(true);
-				expect(registry.getAvailable().some(m => m.provider === "ollama" && m.id === "phi4-mini")).toBe(true);
-				expect(await registry.getApiKey(ollamaModels[0])).toBe(kNoAuth);
-			} finally {
-				globalThis.fetch = originalFetch;
-			}
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+			const ollamaModels = getModelsForProvider(registry, "ollama");
+			expect(ollamaModels.some(m => m.id === "phi4-mini")).toBe(true);
+			expect(registry.getAvailable().some(m => m.provider === "ollama" && m.id === "phi4-mini")).toBe(true);
+			expect(await registry.getApiKey(ollamaModels[0])).toBe(kNoAuth);
 		});
 
 		test("discovers ollama models at runtime and treats auth:none providers as available", async () => {
@@ -650,31 +698,88 @@ describe("ModelRegistry", () => {
 				},
 			});
 
-			const originalFetch = globalThis.fetch;
-			globalThis.fetch = (async (input: string | URL | Request) => {
-				expect(String(input)).toBe("http://127.0.0.1:11434/api/tags");
-				return new Response(
-					JSON.stringify({
-						models: [{ name: "qwen2.5-coder:7b" }, { model: "llama3.2:3b", name: "llama3.2:3b" }],
-					}),
-					{ status: 200, headers: { "Content-Type": "application/json" } },
-				);
-			}) as unknown as typeof fetch;
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "http://127.0.0.1:11434/api/tags") {
+					return new Response(
+						JSON.stringify({
+							models: [{ name: "qwen2.5-coder:7b" }, { model: "llama3.2:3b", name: "llama3.2:3b" }],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "http://127.0.0.1:11434/api/show") {
+					return new Response(JSON.stringify({ capabilities: ["completion"] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
 
-			try {
-				const registry = new ModelRegistry(authStorage, modelsJsonPath);
-				await registry.refresh();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
 
-				const ollamaModels = getModelsForProvider(registry, "ollama");
-				expect(ollamaModels.some(m => m.id === "qwen2.5-coder:7b")).toBe(true);
-				expect(ollamaModels.some(m => m.id === "llama3.2:3b")).toBe(true);
+			const ollamaModels = getModelsForProvider(registry, "ollama");
+			expect(ollamaModels.some(m => m.id === "qwen2.5-coder:7b")).toBe(true);
+			expect(ollamaModels.some(m => m.id === "llama3.2:3b")).toBe(true);
 
-				const available = registry.getAvailable().filter(m => m.provider === "ollama");
-				expect(available.length).toBe(2);
-				expect(await registry.getApiKey(available[0])).toBe(kNoAuth);
-			} finally {
-				globalThis.fetch = originalFetch;
-			}
+			const available = registry.getAvailable().filter(m => m.provider === "ollama");
+			expect(available.length).toBe(2);
+			expect(await registry.getApiKey(available[0])).toBe(kNoAuth);
+		});
+
+		test("discovers ollama thinking capabilities from show metadata", async () => {
+			writeRawModelsJson({
+				ollama: {
+					baseUrl: "http://127.0.0.1:11434/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "ollama" },
+				},
+			});
+
+			using _hook = hookFetch((input, init) => {
+				const url = String(input);
+				if (url === "http://127.0.0.1:11434/api/tags") {
+					return new Response(
+						JSON.stringify({
+							models: [{ name: "qwen3.5:397b-cloud" }, { name: "llama3.2:3b" }],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "http://127.0.0.1:11434/api/show") {
+					const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+					if (body.model === "qwen3.5:397b-cloud") {
+						return new Response(JSON.stringify({ capabilities: ["completion", "thinking"] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					if (body.model === "llama3.2:3b") {
+						return new Response(JSON.stringify({ capabilities: ["completion"] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+				}
+				throw new Error(`Unexpected request: ${url}`);
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+
+			const qwen = registry.find("ollama", "qwen3.5:397b-cloud");
+			expect(qwen?.reasoning).toBe(true);
+			expect(qwen?.thinking).toEqual({
+				mode: "effort",
+				minLevel: Effort.Minimal,
+				maxLevel: Effort.High,
+			});
+
+			const llama = registry.find("ollama", "llama3.2:3b");
+			expect(llama?.reasoning).toBe(false);
 		});
 
 		test("discovery failure does not fail model registry refresh", async () => {
@@ -687,19 +792,14 @@ describe("ModelRegistry", () => {
 				},
 			});
 
-			const originalFetch = globalThis.fetch;
-			globalThis.fetch = (async () => {
+			using _hook = hookFetch(() => {
 				throw new Error("connection refused");
-			}) as unknown as typeof fetch;
+			});
 
-			try {
-				const registry = new ModelRegistry(authStorage, modelsJsonPath);
-				await registry.refresh();
-				expect(getModelsForProvider(registry, "ollama")).toHaveLength(0);
-				expect(registry.getError()).toBeUndefined();
-			} finally {
-				globalThis.fetch = originalFetch;
-			}
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+			expect(getModelsForProvider(registry, "ollama")).toHaveLength(0);
+			expect(registry.getError()).toBeUndefined();
 		});
 	});
 });

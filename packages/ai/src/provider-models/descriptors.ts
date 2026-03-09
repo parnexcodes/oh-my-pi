@@ -8,6 +8,7 @@ import type { Api, KnownProvider } from "../types";
 import type { OAuthProvider } from "../utils/oauth/types";
 import { googleModelManagerOptions } from "./google";
 import {
+	alibabaCodingPlanModelManagerOptions,
 	anthropicModelManagerOptions,
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
@@ -122,7 +123,13 @@ function catalogDescriptor(
  */
 export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	descriptor("anthropic", "claude-sonnet-4-6", config => anthropicModelManagerOptions(config)),
-	descriptor("openai", "gpt-5.1-codex", config => openaiModelManagerOptions(config)),
+	catalogDescriptor(
+		"alibaba-coding-plan",
+		"qwen3.5-plus",
+		config => alibabaCodingPlanModelManagerOptions(config),
+		catalog("Alibaba Coding Plan", ["ALIBABA_CODING_PLAN_API_KEY"]),
+	),
+	descriptor("openai", "gpt-5.4", config => openaiModelManagerOptions(config)),
 	descriptor("groq", "openai/gpt-oss-120b", config => groqModelManagerOptions(config)),
 	catalogDescriptor(
 		"huggingface",
@@ -146,7 +153,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	),
 	catalogDescriptor(
 		"nanogpt",
-		"openai/gpt-5.2",
+		"openai/gpt-5.4",
 		config => nanoGptModelManagerOptions(config),
 		catalog("NanoGPT", ["NANO_GPT_API_KEY"]),
 	),
@@ -154,7 +161,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	descriptor("opencode-go", "kimi-k2.5", config => opencodeGoModelManagerOptions(config)),
 	catalogDescriptor(
 		"openrouter",
-		"openai/gpt-5.1-codex",
+		"openai/gpt-5.4",
 		config => openrouterModelManagerOptions(config),
 		catalog("OpenRouter", ["OPENROUTER_API_KEY"], { allowUnauthenticated: true }),
 	),
@@ -264,6 +271,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 export const DEFAULT_MODEL_PER_PROVIDER: Record<KnownProvider, string> = {
 	...Object.fromEntries(PROVIDER_DESCRIPTORS.map(d => [d.providerId, d.defaultModel])),
 	// Providers not in PROVIDER_DESCRIPTORS (special auth or no standard discovery)
+	"alibaba-coding-plan": "qwen3.5-plus",
 	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
 	"google-antigravity": "gemini-3-pro-high",
 	"google-gemini-cli": "gemini-2.5-pro",
@@ -271,7 +279,7 @@ export const DEFAULT_MODEL_PER_PROVIDER: Record<KnownProvider, string> = {
 	minimax: "MiniMax-M2.5",
 	"minimax-code": "MiniMax-M2.5",
 	"minimax-code-cn": "MiniMax-M2.5",
-	"openai-codex": "gpt-5.3-codex",
+	"openai-codex": "gpt-5.4",
 	zai: "glm-4.6",
 	"gitlab-duo": "duo-chat-sonnet-4-5",
 } as Record<KnownProvider, string>;

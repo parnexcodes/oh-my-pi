@@ -17,6 +17,7 @@ import type {
 	Message,
 	Model,
 	OpenAICompat,
+	ServiceTier,
 	StopReason,
 	StreamFunction,
 	StreamOptions,
@@ -110,6 +111,7 @@ function hasToolHistory(messages: Message[]): boolean {
 export interface OpenAICompletionsOptions extends StreamOptions {
 	toolChoice?: ToolChoice;
 	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
+	serviceTier?: ServiceTier;
 }
 
 type OpenAICompletionsSamplingParams = OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & {
@@ -596,6 +598,9 @@ function buildParams(model: Model<"openai-completions">, context: Context, optio
 	if (options?.repetitionPenalty !== undefined) {
 		params.repetition_penalty = options.repetitionPenalty;
 	}
+	if (options?.serviceTier !== undefined) {
+		params.service_tier = options.serviceTier;
+	}
 
 	if (context.tools) {
 		params.tools = convertTools(context.tools, compat);
@@ -1058,23 +1063,27 @@ function detectStrictModeSupport(provider: string, baseUrl: string): boolean {
  * Provider takes precedence over URL-based detection since it's explicitly configured.
  * Returns a fully resolved OpenAICompat object with all fields set.
  */
-function detectCompat(model: Model<"openai-completions">): ResolvedOpenAICompat {
+export function detectCompat(model: Model<"openai-completions">): ResolvedOpenAICompat {
 	const provider = model.provider;
 	const baseUrl = model.baseUrl;
 
+	const isCerebras = provider === "cerebras" || baseUrl.includes("cerebras.ai");
 	const isZai = provider === "zai" || baseUrl.includes("api.z.ai");
 	const isOpenRouterKimi = provider === "openrouter" && model.id.includes("moonshotai/kimi");
+	const isAlibaba = provider === "alibaba-coding-plan" || baseUrl.includes("dashscope");
+	const isQwen = model.id.toLowerCase().includes("qwen");
 
 	const isNonStandard =
-		provider === "cerebras" ||
-		baseUrl.includes("cerebras.ai") ||
+		isCerebras ||
 		provider === "xai" ||
 		baseUrl.includes("api.x.ai") ||
 		provider === "mistral" ||
 		baseUrl.includes("mistral.ai") ||
 		baseUrl.includes("chutes.ai") ||
 		baseUrl.includes("deepseek.com") ||
+		isAlibaba ||
 		isZai ||
+		isQwen ||
 		provider === "opencode-zen" ||
 		provider === "opencode-go" ||
 		baseUrl.includes("opencode.ai");
@@ -1089,14 +1098,14 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAICompat 
 		supportsStore: !isNonStandard,
 		supportsDeveloperRole: !isNonStandard,
 		supportsReasoningEffort: !isGrok && !isZai,
-		supportsUsageInStreaming: true,
+		supportsUsageInStreaming: !isCerebras,
 		supportsToolChoice: true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: isMistral,
 		requiresAssistantAfterToolResult: false, // Mistral no longer requires this as of Dec 2024
 		requiresThinkingAsText: isMistral,
 		requiresMistralToolIds: isMistral,
-		thinkingFormat: isZai ? "zai" : "openai",
+		thinkingFormat: isZai ? "zai" : isAlibaba || isQwen ? "qwen" : "openai",
 		reasoningContentField: "reasoning_content",
 		requiresReasoningContentForToolCalls: isOpenRouterKimi,
 		requiresAssistantContentForToolCalls: isOpenRouterKimi,

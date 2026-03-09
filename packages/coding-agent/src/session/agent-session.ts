@@ -24,15 +24,17 @@ import {
 	type AgentState,
 	type AgentTool,
 	INTENT_FIELD,
+	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type {
 	AssistantMessage,
+	Effort,
 	ImageContent,
 	Message,
 	Model,
 	ProviderSessionState,
+	ServiceTier,
 	TextContent,
-	ThinkingLevel,
 	ToolCall,
 	ToolChoice,
 	Usage,
@@ -40,11 +42,10 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import {
 	calculateRateLimitBackoffMs,
-	getAvailableThinkingLevels,
+	getSupportedEfforts,
 	isContextOverflow,
 	modelsAreEqual,
 	parseRateLimitReason,
-	supportsXhigh,
 } from "@oh-my-pi/pi-ai";
 import { abortableSleep, getAgentDbPath, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async";
@@ -88,6 +89,7 @@ import { getCurrentThemeName, theme } from "../modes/theme/theme";
 import { normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../patch";
 import type { PlanModeState } from "../plan-mode/state";
 import autoHandoffThresholdFocusPrompt from "../prompts/system/auto-handoff-threshold-focus.md" with { type: "text" };
+import handoffDocumentPrompt from "../prompts/system/handoff-document.md" with { type: "text" };
 import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { type: "text" };
 import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" with { type: "text" };
 import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool-decision-reminder.md" with {
@@ -95,6 +97,7 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 };
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
 import type { SecretObfuscator } from "../secrets/obfuscator";
+import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import type { CheckpointState } from "../tools/checkpoint";
 import { outputMeta } from "../tools/output-meta";
 import { resolveToCwd } from "../tools/path-utils";
@@ -106,6 +109,7 @@ import { extractFileMentions, generateFileMentionMessages } from "../utils/file-
 import {
 	type CompactionResult,
 	calculateContextTokens,
+	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	compact,
 	estimateTokens,
@@ -165,7 +169,9 @@ export interface AgentSessionConfig {
 	/** Async background jobs launched by tools */
 	asyncJobManager?: AsyncJobManager;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
-	scopedModels?: Array<{ model: Model; thinkingLevel: ThinkingLevel }>;
+	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	/** Initial session thinking selector. */
+	thinkingLevel?: ThinkingLevel;
 	/** Prompt templates for expansion */
 	promptTemplates?: PromptTemplate[];
 	/** File-based slash commands for expansion */
@@ -214,7 +220,7 @@ export interface PromptOptions {
 /** Result from cycleModel() */
 export interface ModelCycleResult {
 	model: Model;
-	thinkingLevel: ThinkingLevel;
+	thinkingLevel: ThinkingLevel | undefined;
 	/** Whether cycling through scoped models (--models flag) or all available */
 	isScoped: boolean;
 }
@@ -222,7 +228,7 @@ export interface ModelCycleResult {
 /** Result from cycleRoleModels() */
 export interface RoleModelCycleResult {
 	model: Model;
-	thinkingLevel: ThinkingLevel;
+	thinkingLevel: ThinkingLevel | undefined;
 	role: ModelRole;
 }
 
@@ -255,6 +261,7 @@ export interface HandoffResult {
 interface HandoffOptions {
 	autoTriggered?: boolean;
 	signal?: AbortSignal;
+	skipPostPromptRecoveryWait?: boolean;
 }
 
 /** Internal marker for hook messages queued through the agent loop */
@@ -304,7 +311,8 @@ export class AgentSession {
 	readonly settings: Settings;
 
 	#asyncJobManager: AsyncJobManager | undefined = undefined;
-	#scopedModels: Array<{ model: Model; thinkingLevel: ThinkingLevel }>;
+	#scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	#thinkingLevel: ThinkingLevel | undefined;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -391,7 +399,7 @@ export class AgentSession {
 	#streamingEditAbortTriggered = false;
 	#streamingEditCheckedLineCounts = new Map<string, number>();
 	#streamingEditFileCache = new Map<string, string>();
-	#promptInFlight = false;
+	#promptInFlightCount = 0;
 	#obfuscator: SecretObfuscator | undefined;
 	#pendingActionStore: PendingActionStore | undefined;
 	#checkpointState: CheckpointState | undefined = undefined;
@@ -405,6 +413,7 @@ export class AgentSession {
 		this.settings = config.settings;
 		this.#asyncJobManager = config.asyncJobManager;
 		this.#scopedModels = config.scopedModels ?? [];
+		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
@@ -1543,13 +1552,17 @@ export class AgentSession {
 	}
 
 	/** Current thinking level */
-	get thinkingLevel(): ThinkingLevel {
-		return this.agent.state.thinkingLevel;
+	get thinkingLevel(): ThinkingLevel | undefined {
+		return this.#thinkingLevel;
+	}
+
+	get serviceTier(): ServiceTier | undefined {
+		return this.agent.serviceTier;
 	}
 
 	/** Whether agent is currently streaming a response */
 	get isStreaming(): boolean {
-		return this.agent.state.isStreaming || this.#promptInFlight;
+		return this.agent.state.isStreaming || this.#promptInFlightCount > 0;
 	}
 
 	/** Wait until streaming and deferred recovery work are fully settled. */
@@ -1719,7 +1732,7 @@ export class AgentSession {
 	}
 
 	/** Scoped models for cycling (from --models flag) */
-	get scopedModels(): ReadonlyArray<{ model: Model; thinkingLevel: ThinkingLevel }> {
+	get scopedModels(): ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }> {
 		return this.#scopedModels;
 	}
 
@@ -1988,7 +2001,7 @@ export class AgentSession {
 			skipPostPromptRecoveryWait?: boolean;
 		},
 	): Promise<void> {
-		this.#promptInFlight = true;
+		this.#promptInFlightCount++;
 		const generation = this.#promptGeneration;
 		try {
 			// Flush any pending bash messages before the new prompt
@@ -2098,7 +2111,7 @@ export class AgentSession {
 				await this.#waitForPostPromptRecovery();
 			}
 		} finally {
-			this.#promptInFlight = false;
+			this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		}
 	}
 
@@ -2497,11 +2510,10 @@ export class AgentSession {
 		this.#cancelPostPromptTasks();
 		this.agent.abort();
 		await this.agent.waitForIdle();
-		// Clear promptInFlight: waitForIdle resolves when the agent loop's finally
-		// block runs (#resolveRunningPrompt), but #promptWithMessage's finally
-		// (#promptInFlight = false) fires on a later microtask. Without this,
-		// isStreaming stays true and a subsequent prompt() throws.
-		this.#promptInFlight = false;
+		// Clear prompt-in-flight state: waitForIdle resolves when the agent loop's finally
+		// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
+		// a subsequent prompt() can incorrectly observe the session as busy after an abort.
+		this.#promptInFlightCount = 0;
 	}
 
 	/**
@@ -2539,6 +2551,7 @@ export class AgentSession {
 		this.#pendingNextTurnMessages = [];
 
 		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+		this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
 
 		this.#todoReminderCount = 0;
 		this.#planReferenceSent = false;
@@ -2648,7 +2661,7 @@ export class AgentSession {
 		this.settings.setModelRole(role, this.#formatRoleModelValue(role, model));
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
-		// Re-clamp thinking level for new model's capabilities without persisting settings
+		// Re-apply the current thinking level for the newly selected model
 		this.setThinkingLevel(this.thinkingLevel);
 	}
 
@@ -2667,7 +2680,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "temporary");
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
-		// Re-clamp thinking level for new model's capabilities without persisting settings
+		// Re-apply the current thinking level for the newly selected model
 		this.setThinkingLevel(this.thinkingLevel);
 	}
 
@@ -2752,9 +2765,9 @@ export class AgentSession {
 		return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
 	}
 
-	async #getScopedModelsWithApiKey(): Promise<Array<{ model: Model; thinkingLevel: ThinkingLevel }>> {
+	async #getScopedModelsWithApiKey(): Promise<Array<{ model: Model; thinkingLevel?: ThinkingLevel }>> {
 		const apiKeysByProvider = new Map<string, string | undefined>();
-		const result: Array<{ model: Model; thinkingLevel: ThinkingLevel }> = [];
+		const result: Array<{ model: Model; thinkingLevel?: ThinkingLevel }> = [];
 
 		for (const scoped of this.#scopedModels) {
 			const provider = scoped.model.provider;
@@ -2792,7 +2805,7 @@ export class AgentSession {
 		this.settings.setModelRole("default", this.#formatRoleModelValue("default", next.model));
 		this.settings.getStorage()?.recordModelUsage(`${next.model.provider}/${next.model.id}`);
 
-		// Apply thinking level (setThinkingLevel clamps to model capabilities)
+		// Apply the scoped model's configured thinking level
 		this.setThinkingLevel(next.thinkingLevel);
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
@@ -2820,7 +2833,7 @@ export class AgentSession {
 		this.settings.setModelRole("default", this.#formatRoleModelValue("default", nextModel));
 		this.settings.getStorage()?.recordModelUsage(`${nextModel.provider}/${nextModel.id}`);
 
-		// Re-clamp thinking level for new model's capabilities without persisting settings
+		// Re-apply the current thinking level for the newly selected model
 		this.setThinkingLevel(this.thinkingLevel);
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
@@ -2839,21 +2852,18 @@ export class AgentSession {
 
 	/**
 	 * Set thinking level.
-	 * Clamps to model capabilities based on available thinking levels.
-	 * Saves to session and settings only if the level actually changes.
+	 * Saves the effective metadata-clamped level to session and settings only if it changes.
 	 */
-	setThinkingLevel(level: ThinkingLevel, persist: boolean = false): void {
-		const availableLevels = this.getAvailableThinkingLevels();
-		const effectiveLevel = availableLevels.includes(level) ? level : this.#clampThinkingLevel(level, availableLevels);
+	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
+		const effectiveLevel = resolveThinkingLevelForModel(this.model, level);
+		const isChanging = effectiveLevel !== this.#thinkingLevel;
 
-		// Only persist if actually changing
-		const isChanging = effectiveLevel !== this.agent.state.thinkingLevel;
-
-		this.agent.setThinkingLevel(effectiveLevel);
+		this.#thinkingLevel = effectiveLevel;
+		this.agent.setThinkingLevel(toReasoningEffort(effectiveLevel));
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (persist) {
+			if (persist && effectiveLevel !== undefined && effectiveLevel !== ThinkingLevel.Off) {
 				this.settings.set("defaultThinkingLevel", effectiveLevel);
 			}
 		}
@@ -2863,57 +2873,48 @@ export class AgentSession {
 	 * Cycle to next thinking level.
 	 * @returns New level, or undefined if model doesn't support thinking
 	 */
-	cycleThinkingLevel(): ThinkingLevel | undefined {
-		if (!this.supportsThinking()) return undefined;
+	cycleThinkingLevel(): Effort | undefined {
+		if (!this.model?.reasoning) return undefined;
 
 		const levels = this.getAvailableThinkingLevels();
-		const currentIndex = levels.indexOf(this.thinkingLevel);
+		const currentIndex =
+			this.thinkingLevel && this.thinkingLevel !== ThinkingLevel.Off && this.thinkingLevel !== ThinkingLevel.Inherit
+				? levels.indexOf(this.thinkingLevel)
+				: -1;
 		const nextIndex = (currentIndex + 1) % levels.length;
 		const nextLevel = levels[nextIndex];
+		if (!nextLevel) return undefined;
 
 		this.setThinkingLevel(nextLevel);
 		return nextLevel;
 	}
 
+	isFastModeEnabled(): boolean {
+		return this.serviceTier === "priority";
+	}
+
+	setServiceTier(serviceTier: ServiceTier | undefined): void {
+		if (this.serviceTier === serviceTier) return;
+		this.agent.serviceTier = serviceTier;
+		this.sessionManager.appendServiceTierChange(serviceTier ?? null);
+	}
+
+	setFastMode(enabled: boolean): void {
+		this.setServiceTier(enabled ? "priority" : undefined);
+	}
+
+	toggleFastMode(): boolean {
+		const enabled = !this.isFastModeEnabled();
+		this.setFastMode(enabled);
+		return enabled;
+	}
+
 	/**
 	 * Get available thinking levels for current model.
-	 * The provider will clamp to what the specific model supports internally.
 	 */
-	getAvailableThinkingLevels(): ReadonlyArray<ThinkingLevel> {
-		if (!this.supportsThinking()) return ["off"];
-		return getAvailableThinkingLevels(this.supportsXhighThinking());
-	}
-
-	/**
-	 * Check if current model supports xhigh thinking level.
-	 */
-	supportsXhighThinking(): boolean {
-		return this.model ? supportsXhigh(this.model) : false;
-	}
-
-	/**
-	 * Check if current model supports thinking/reasoning.
-	 */
-	supportsThinking(): boolean {
-		return !!this.model?.reasoning;
-	}
-
-	#clampThinkingLevel(level: ThinkingLevel, availableLevels: ReadonlyArray<ThinkingLevel>): ThinkingLevel {
-		const ordered = getAvailableThinkingLevels(true);
-		const available = new Set(availableLevels);
-		const requestedIndex = ordered.indexOf(level);
-		if (requestedIndex === -1) {
-			return availableLevels[0] ?? "off";
-		}
-		for (let i = requestedIndex; i < ordered.length; i++) {
-			const candidate = ordered[i];
-			if (available.has(candidate)) return candidate;
-		}
-		for (let i = requestedIndex - 1; i >= 0; i--) {
-			const candidate = ordered[i];
-			if (available.has(candidate)) return candidate;
-		}
-		return availableLevels[0] ?? "off";
+	getAvailableThinkingLevels(): ReadonlyArray<Effort> {
+		if (!this.model) return [];
+		return getSupportedEfforts(this.model);
 	}
 
 	// =========================================================================
@@ -3061,13 +3062,14 @@ export class AgentSession {
 					apiKey,
 					customInstructions,
 					this.#compactionAbortController.signal,
-					{ promptOverride: hookPrompt, extraContext: hookContext },
+					{ promptOverride: hookPrompt, extraContext: hookContext, remoteInstructions: this.#baseSystemPrompt },
 				);
 				summary = result.summary;
 				shortSummary = result.shortSummary;
 				firstKeptEntryId = result.firstKeptEntryId;
 				tokensBefore = result.tokensBefore;
 				details = result.details;
+				preserveData = { ...(preserveData ?? {}), ...(result.preserveData ?? {}) };
 			}
 
 			if (this.#compactionAbortController.signal.aborted) {
@@ -3193,41 +3195,9 @@ export class AgentSession {
 		}
 
 		// Build the handoff prompt
-		let handoffPrompt = `Write a comprehensive handoff document that will allow another instance of yourself to seamlessly continue this work. The document should capture everything needed to resume without access to this conversation.
-
-Use this format:
-
-## Goal
-[What the user is trying to accomplish]
-
-## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned]
-
-## Progress
-### Done
-- [x] [Completed tasks with specifics]
-
-### In Progress
-- [ ] [Current work if any]
-
-### Pending
-- [ ] [Tasks mentioned but not started]
-
-## Key Decisions
-- **[Decision]**: [Rationale]
-
-## Critical Context
-- [Code snippets, file paths, error messages, or data essential to continue]
-- [Repository state if relevant]
-
-## Next Steps
-1. [What should happen next]
-
-Be thorough - include exact file paths, function names, error messages, and technical details. Output ONLY the handoff document, no other text.`;
-
-		if (customInstructions) {
-			handoffPrompt += `\n\nAdditional focus: ${customInstructions}`;
-		}
+		const handoffPrompt = renderPromptTemplate(handoffDocumentPrompt, {
+			additionalFocus: customInstructions,
+		});
 
 		// Create a promise that resolves when the agent completes
 		let handoffText: string | undefined;
@@ -3272,11 +3242,16 @@ Be thorough - include exact file paths, function names, error messages, and tech
 			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
 			}
-			await this.prompt(handoffPrompt, {
-				expandPromptTemplates: false,
-				synthetic: true,
-				skipCompactionCheck: true,
-			});
+			await this.#promptWithMessage(
+				{
+					role: "developer",
+					content: [{ type: "text", text: handoffPrompt }],
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+				handoffPrompt,
+				{ skipCompactionCheck: true, skipPostPromptRecoveryWait: options?.skipPostPromptRecoveryWait },
+			);
 			await completionPromise;
 
 			if (handoffCancelled || handoffSignal.aborted) {
@@ -3729,11 +3704,22 @@ Be thorough - include exact file paths, function names, error messages, and tech
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	async #runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<void> {
+	async #runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean, deferred = false): Promise<void> {
 		const compactionSettings = this.settings.getGroup("compaction");
-
 		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return;
 		const generation = this.#promptGeneration;
+		if (!deferred && reason !== "overflow" && compactionSettings.strategy === "handoff") {
+			this.#schedulePostPromptTask(
+				async signal => {
+					await Promise.resolve();
+					if (signal.aborted) return;
+					await this.#runAutoCompaction(reason, willRetry, true);
+				},
+				{ generation },
+			);
+			return;
+		}
+
 		let action: "context-full" | "handoff" =
 			compactionSettings.strategy === "handoff" && reason !== "overflow" ? "handoff" : "context-full";
 		await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
@@ -3749,6 +3735,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 				const handoffResult = await this.handoff(handoffFocus, {
 					autoTriggered: true,
 					signal: this.#autoCompactionAbortController.signal,
+					skipPostPromptRecoveryWait: true,
 				});
 				if (!handoffResult) {
 					const aborted = this.#autoCompactionAbortController.signal.aborted;
@@ -3813,6 +3800,13 @@ Be thorough - include exact file paths, function names, error messages, and tech
 					aborted: false,
 					willRetry: false,
 				});
+				if (!willRetry && this.agent.hasQueuedMessages()) {
+					this.#scheduleAgentContinue({
+						delayMs: 100,
+						generation,
+						shouldContinue: () => this.agent.hasQueuedMessages(),
+					});
+				}
 				return;
 			}
 
@@ -3894,7 +3888,11 @@ Be thorough - include exact file paths, function names, error messages, and tech
 								apiKey,
 								undefined,
 								this.#autoCompactionAbortController.signal,
-								{ promptOverride: hookPrompt, extraContext: hookContext },
+								{
+									promptOverride: hookPrompt,
+									extraContext: hookContext,
+									remoteInstructions: this.#baseSystemPrompt,
+								},
 							);
 							break;
 						} catch (error) {
@@ -3963,6 +3961,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 				firstKeptEntryId = compactResult.firstKeptEntryId;
 				tokensBefore = compactResult.tokensBefore;
 				details = compactResult.details;
+				preserveData = { ...(preserveData ?? {}), ...(compactResult.preserveData ?? {}) };
 			}
 
 			if (this.#autoCompactionAbortController.signal.aborted) {
@@ -4015,15 +4014,25 @@ Be thorough - include exact file paths, function names, error messages, and tech
 			await this.#emitSessionEvent({ type: "auto_compaction_end", action, result, aborted: false, willRetry });
 
 			if (!willRetry && compactionSettings.autoContinue !== false) {
-				await this.#promptWithMessage(
-					{
-						role: "developer",
-						content: [{ type: "text", text: "Continue if you have next steps." }],
-						attribution: "agent",
-						timestamp: Date.now(),
+				const continuePrompt = async () => {
+					await this.#promptWithMessage(
+						{
+							role: "developer",
+							content: [{ type: "text", text: "Continue if you have next steps." }],
+							attribution: "agent",
+							timestamp: Date.now(),
+						},
+						"Continue if you have next steps.",
+						{ skipPostPromptRecoveryWait: true },
+					);
+				};
+				this.#schedulePostPromptTask(
+					async signal => {
+						await Promise.resolve();
+						if (signal.aborted) return;
+						await continuePrompt();
 					},
-					"Continue if you have next steps.",
-					{ skipPostPromptRecoveryWait: true },
+					{ generation },
 				);
 			}
 
@@ -4614,18 +4623,22 @@ Be thorough - include exact file paths, function names, error messages, and tech
 		}
 
 		const hasThinkingEntry = this.sessionManager.getBranch().some(entry => entry.type === "thinking_level_change");
-		const defaultThinkingLevel = (this.settings.get("defaultThinkingLevel") ?? "off") as ThinkingLevel;
+		const hasServiceTierEntry = this.sessionManager.getBranch().some(entry => entry.type === "service_tier_change");
+		const defaultThinkingLevel = this.settings.get("defaultThinkingLevel");
 
 		if (hasThinkingEntry) {
-			// Restore thinking level if saved (setThinkingLevel clamps to model capabilities)
-			this.setThinkingLevel(sessionContext.thinkingLevel as ThinkingLevel);
+			this.setThinkingLevel(sessionContext.thinkingLevel as ThinkingLevel | undefined);
 		} else {
-			const availableLevels = this.getAvailableThinkingLevels();
-			const effectiveLevel = availableLevels.includes(defaultThinkingLevel)
-				? defaultThinkingLevel
-				: this.#clampThinkingLevel(defaultThinkingLevel, availableLevels);
-			this.agent.setThinkingLevel(effectiveLevel);
-			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+			const effectiveDefaultThinkingLevel = resolveThinkingLevelForModel(this.model, defaultThinkingLevel);
+			this.#thinkingLevel = effectiveDefaultThinkingLevel;
+			this.agent.setThinkingLevel(toReasoningEffort(effectiveDefaultThinkingLevel));
+			this.sessionManager.appendThinkingLevelChange(effectiveDefaultThinkingLevel);
+		}
+
+		if (hasServiceTierEntry) {
+			this.agent.serviceTier = sessionContext.serviceTier;
+		} else {
+			this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
 		}
 
 		this.#reconnectToAgent();
@@ -5060,7 +5073,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 			};
 		}
 
-		const usageTokens = calculateContextTokens(lastUsage);
+		const usageTokens = calculatePromptTokens(lastUsage);
 		let trailingTokens = 0;
 		for (let i = lastUsageIndex + 1; i < messages.length; i++) {
 			trailingTokens += estimateTokens(messages[i]);
@@ -5142,7 +5155,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 
 		// Include model and thinking level
 		const model = this.agent.state.model;
-		const thinkingLevel = this.agent.state.thinkingLevel;
+		const thinkingLevel = this.#thinkingLevel;
 		lines.push("## Configuration\n");
 		lines.push(`Model: ${model.provider}/${model.id}`);
 		lines.push(`Thinking Level: ${thinkingLevel}`);

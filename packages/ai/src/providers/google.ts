@@ -217,11 +217,17 @@ export const streamGoogle: StreamFunction<"google-generative-ai"> = (
 				}
 
 				if (chunk.usageMetadata) {
+					// promptTokenCount includes cachedContentTokenCount when cached content is used.
+					// Subtract to get non-cached input, matching the OpenAI convention where
+					// input = uncached prompt tokens and cacheRead = cached tokens so that
+					// input + cacheRead = total prompt tokens (no double-counting).
+					// Ref: https://ai.google.dev/api/generate-content#v1beta.GenerateContentResponse.UsageMetadata
+					const cachedTokens = chunk.usageMetadata.cachedContentTokenCount || 0;
 					output.usage = {
-						input: chunk.usageMetadata.promptTokenCount || 0,
+						input: (chunk.usageMetadata.promptTokenCount || 0) - cachedTokens,
 						output:
 							(chunk.usageMetadata.candidatesTokenCount || 0) + (chunk.usageMetadata.thoughtsTokenCount || 0),
-						cacheRead: chunk.usageMetadata.cachedContentTokenCount || 0,
+						cacheRead: cachedTokens,
 						cacheWrite: 0,
 						totalTokens: chunk.usageMetadata.totalTokenCount || 0,
 						cost: {
@@ -348,14 +354,14 @@ function buildParams(
 	}
 
 	if (options.thinking?.enabled && model.reasoning) {
-		const thinkingConfig: ThinkingConfig = { includeThoughts: true };
+		const cfg: ThinkingConfig = { includeThoughts: true };
 		if (options.thinking.level !== undefined) {
 			// Cast to any since our GoogleThinkingLevel mirrors Google's ThinkingLevel enum values
-			thinkingConfig.thinkingLevel = options.thinking.level as any;
+			cfg.thinkingLevel = options.thinking.level as any;
 		} else if (options.thinking.budgetTokens !== undefined) {
-			thinkingConfig.thinkingBudget = options.thinking.budgetTokens;
+			cfg.thinkingBudget = options.thinking.budgetTokens;
 		}
-		config.thinkingConfig = thinkingConfig;
+		config.thinkingConfig = cfg;
 	}
 
 	if (options.signal) {
